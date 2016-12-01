@@ -4,10 +4,7 @@ if (rx === undefined || rx.Observable === undefined) {
   throw new Error('Leak$ - No Rx');
 }
 
-var log = console.log.bind(console);
-var getProto = Object.getPrototypeOf.bind(Object);
-var defProp = Object.defineProperty.bind(Object);
-var hasOwn = Object.prototype.hasOwnProperty;
+// Helpers
 
 function throttle(callback, time) {
   var timer;
@@ -30,57 +27,91 @@ function throttle(callback, time) {
 
 var weakMap = (function() {
   var KEY = '09871283ubajskndbjvh';
-  var NULL = {};
   return ({
-    get: function(o) {
-      var v = o[KEY];
-      return v === NULL ? undefined : v;
+    get: function (o) {
+      return o[KEY];
     },
-    set: function(o, v) {
-      defProp(o, KEY, { configurable: true, writable: true, value: v });
+    set: function (o, v) {
+      Object.defineProperty(o, KEY, { configurable: true, writable: true, value: v });
     },
-    has: function(o) {
-      return hasOwn.call(o, KEY) && o[KEY] !== NULL;
+    has: function (o) {
+      return Object.prototype.hasOwnProperty.call(o, KEY);
     },
-    delete: function(o) {
-      defProp(o, KEY, { configurable: true, writable: true, value: NULL });
+    delete: function (o) {
+      delete o[KEY];
     }
   });
 })();
 
-var o = rx.Observable.just(1);
-var po = getProto(o);
-var ppo = getProto(po);
-var pppo = getProto(ppo);
+var getStackTrace = function() {
+  try {
+    throw new Error();
+  } catch (e) {
+    return e.stack.split('\n').filter(function(s) { return !/\/rx\./.test(s) && !/leaks\.js/.test(s); }).join('>>');
+  }
+};
 
-var subscriptions = 0;
-var printSubscriptions = throttle(function() {
-  log('subscriptions', subscriptions);
-}, 1000);
-var up = function() { subscriptions += 1; printSubscriptions(); };
-var down = function() { subscriptions -= 1; printSubscriptions(); };
+// Logic
+var errorSubject = new Rx.Subject();
 
-var originalSubscribe = pppo.subscribe;
-var insideSubscribe = false; // Handle recursive code inside RxJs
-var insideSubscribe_true = function() {
-  insideSubscribe = true;
-  return function() {
-    insideSubscribe = false;
+var global = window.leaks = {
+  pushError: function() { errorSubject.onNext(new Error('Leak$ error triggered')); },
+  trace: false,
+  stacks: {}
+};
+
+var addStack = function() {
+  var stack = getStackTrace();
+  if (stack == null || stack == "") {
+    return undefined;
+  }
+  var existingCounter = global.stacks[stack];
+  if (!existingCounter) {
+    existingCounter = { counter: 0 };
+    global.stacks[stack] = existingCounter;
+  }
+  existingCounter.counter++;
+
+  return function removeStack() {
+    if (--(existingCounter.counter) === 0) {
+      var currentCounter = global.stacks[stack];
+      if (currentCounter === existingCounter) {
+        delete global.stacks[stack];
+      }
+    }
   };
 };
 
-var wrapObservable = function(observable) {
-  return rx.Observable.create(function (observer) {
-    up();
-    var disposable = originalSubscribe.call(observable, observer);
-    return function() {
-      down();
-      disposable.dispose();
-    };
-  });
-};
+var logNewSubscription, logSubscriptionDisposed;
+(function() {
+  var subscriptions = 0;
+  var printSubscriptions = throttle(function() {
+    console.log('subscriptions', subscriptions);
+  }, 1500);
+  logNewSubscription = function() { subscriptions += 1; printSubscriptions(); };
+  logSubscriptionDisposed = function() { subscriptions -= 1; printSubscriptions(); };
+})();
 
-pppo.subscribe = function() {
+var originalSubscribe = rx.ObservableBase.prototype.subscribe;
+rx.ObservableBase.prototype.subscribe = function() {
+  function wrapObservable(observable) {
+    return rx.Observable.create(function(observer) {
+      logNewSubscription();
+      var removeStack;
+      var disposable = new rx.CompositeDisposable();
+      if (global.trace) {
+        removeStack = addStack();
+        disposable.add(errorSubject.subscribe(function(e) { observer.onError(e); }));
+      }
+      disposable.add(originalSubscribe.call(observable, observer));
+      return function() {
+        logSubscriptionDisposed();
+        removeStack && removeStack();
+        disposable.dispose();
+      };
+    });
+  };
+
   var ob = this;
   var newOb = weakMap.get(ob);
   if (!newOb) {
