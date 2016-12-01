@@ -1,4 +1,4 @@
-;(function(rx) {
+;(function(global, rx) {
 
 if (rx === undefined || rx.Observable === undefined) {
   throw new Error('Leak$ - No Rx');
@@ -52,12 +52,13 @@ var getStackTrace = function() {
 };
 
 // Logic
-var errorSubject = new Rx.Subject();
+var errorSubject = new rx.Subject();
 
-var global = window.leaks = {
+var Leaks = global.leaks = {
   pushError: function() { errorSubject.onNext(new Error('Leak$ error triggered')); },
   trace: false,
-  stacks: {}
+  stacks: {},
+  subscriptions: new Rx.BehaviorSubject(0)
 };
 
 var addStack = function() {
@@ -65,43 +66,39 @@ var addStack = function() {
   if (stack == null || stack == "") {
     return undefined;
   }
-  var existingCounter = global.stacks[stack];
+  var existingCounter = Leaks.stacks[stack];
   if (!existingCounter) {
     existingCounter = { counter: 0 };
-    global.stacks[stack] = existingCounter;
+    Leaks.stacks[stack] = existingCounter;
   }
   existingCounter.counter++;
 
   return function removeStack() {
     if (--(existingCounter.counter) === 0) {
-      var currentCounter = global.stacks[stack];
+      var currentCounter = Leaks.stacks[stack];
       if (currentCounter === existingCounter) {
-        delete global.stacks[stack];
+        delete Leaks.stacks[stack];
       }
     }
   };
 };
 
-var logNewSubscription, logSubscriptionDisposed;
-(function() {
-  var subscriptions = 0;
-  var printSubscriptions = throttle(function() {
-    console.log('subscriptions', subscriptions);
-  }, 1500);
-  logNewSubscription = function() { subscriptions += 1; printSubscriptions(); };
-  logSubscriptionDisposed = function() { subscriptions -= 1; printSubscriptions(); };
-})();
+var logNewSubscription = function() { Leaks.subscriptions.onNext(Leaks.subscriptions.getValue() + 1); };
+var logSubscriptionDisposed = function() { Leaks.subscriptions.onNext(Leaks.subscriptions.getValue() - 1); };
+Leaks.subscriptions.subscribe(throttle(function() {
+  console.log('subscriptions', Leaks.subscriptions.getValue());
+}, 1500));
 
-var originalSubscribe = rx.ObservableBase.prototype.subscribe;
-rx.ObservableBase.prototype.subscribe = function() {
+var originalSubscribe = rx.Observable.prototype.subscribe;
+rx.Observable.prototype.subscribe = function() {
   function wrapObservable(observable) {
     return rx.Observable.create(function(observer) {
       logNewSubscription();
       var removeStack;
       var disposable = new rx.CompositeDisposable();
-      if (global.trace) {
+      if (Leaks.trace) {
         removeStack = addStack();
-        disposable.add(errorSubject.subscribe(function(e) { observer.onError(e); }));
+        disposable.add(originalSubscribe.call(errorSubject, function(e) { observer.onError(e); }));
       }
       disposable.add(originalSubscribe.call(observable, observer));
       return function() {
@@ -122,4 +119,4 @@ rx.ObservableBase.prototype.subscribe = function() {
   return originalSubscribe.apply(newOb, arguments);
 };
 
-})(Rx);
+})(typeof global === 'object' ? global : this, typeof global === 'object' ? global.Rx : this.Rx);
